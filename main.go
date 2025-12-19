@@ -14,6 +14,7 @@ import (
     "sync/atomic"
     "time"
 
+    "github.com/fsnotify/fsnotify"
     "github.com/cloudflare/ahocorasick"
     "github.com/go-telegram/bot"
     "github.com/go-telegram/bot/models"
@@ -247,34 +248,6 @@ func loadKeywordsFolderHot(folder string) []string {
     return keywords
 }
 
-// startACHotReload 启动热更新 goroutine，每 interval 扫描一次文件夹
-func startACHotReload(folder string, interval time.Duration) {
-    // 启动前确保文件夹存在
-    if _, err := os.Stat(folder); os.IsNotExist(err) {
-        log.Printf("⚠️ 文件夹 %s 不存在，自动创建", folder)
-        if err := os.MkdirAll(folder, 0755); err != nil {
-            log.Fatalf("创建文件夹 %s 失败: %v", folder, err)
-        }
-    }
-
-    // 初始化一个空自动机（空关键词切片）避免 atomic.Store(nil) panic
-    acMatcher.Store(ahocorasick.NewStringMatcher([]string{}))
-
-    go func() {
-        for {
-            keywords := loadKeywordsFolderHot(folder)
-            if len(keywords) > 0 {
-                newMatcher := ahocorasick.NewStringMatcher(keywords)
-                acMatcher.Store(newMatcher) // 原子替换，无锁读取
-            } else {
-                // 空切片生成空自动机，不再存 nil
-                acMatcher.Store(ahocorasick.NewStringMatcher([]string{}))
-            }
-            time.Sleep(interval)
-        }
-    }()
-}
-
 // extractTextFromMessage 提取消息里的所有可检测文本
 func extractTextFromMessage(msg *models.Message) string {
     var parts []string
@@ -317,7 +290,61 @@ func containsAnyKeywordAC(text string) bool {
 
 // initAC 初始化自动机（启动热更新）
 func initAC() {
-    startACHotReload("keywords", 5*time.Second)
+    folder := "keywords"
+
+    // 创建文件夹（如果不存在）
+    if _, err := os.Stat(folder); os.IsNotExist(err) {
+        log.Printf("⚠️ 文件夹 %s 不存在，自动创建", folder)
+        if err := os.MkdirAll(folder, 0755); err != nil {
+            log.Fatalf("创建文件夹 %s 失败: %v", folder, err)
+        }
+    }
+
+    // 初始化空自动机
+    acMatcher.Store(ahocorasick.NewStringMatcher([]string{}))
+
+    // 先加载一次
+    keywords := loadKeywordsFolderHot(folder)
+    if len(keywords) > 0 {
+        acMatcher.Store(ahocorasick.NewStringMatcher(keywords))
+    }
+
+    // fsnotify 监控
+    watcher, err := fsnotify.NewWatcher()
+    if err != nil {
+        log.Fatalf("fsnotify.NewWatcher failed: %v", err)
+    }
+
+    go func() {
+        defer watcher.Close()
+        for {
+            select {
+            case event, ok := <-watcher.Events:
+                if !ok {
+                    return
+                }
+                // 只处理写入、创建、删除事件
+                if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove) != 0 {
+                    keywords := loadKeywordsFolderHot(folder)
+                    if len(keywords) > 0 {
+                        acMatcher.Store(ahocorasick.NewStringMatcher(keywords))
+                    } else {
+                        acMatcher.Store(ahocorasick.NewStringMatcher([]string{}))
+                    }
+                }
+            case err, ok := <-watcher.Errors:
+                if !ok {
+                    return
+                }
+                log.Printf("fsnotify error: %v", err)
+            }
+        }
+    }()
+
+    // 添加文件夹监控
+    if err := watcher.Add(folder); err != nil {
+        log.Fatalf("fsnotify add folder failed: %v", err)
+    }
 }
 
 // =====================
@@ -365,7 +392,7 @@ if update.Message != nil {
     if forwardDetected {
         // 删除消息
         _ = deleteMessageWithRetry(ctx, b, chatID, msg.ID)
-        log.Printf("🚫 已删除用户 %d 的转发消息", userID)
+        log.Printf("🚫 已删除用户 %d(%s) 的转发消息", userID, userName)
 
         // 发送提醒
         warnText := fmt.Sprintf("<a href=\"tg://user?id=%d\">%s</a>：请注意，禁止批量转发消息。", userID, userName)
@@ -386,7 +413,7 @@ if update.Message != nil {
     content := extractTextFromMessage(msg)
     if containsAnyKeywordAC(content) {
         _ = deleteMessageWithRetry(ctx, b, chatID, msg.ID)
-        log.Printf("🚫 已删除用户 %d 的敏感关键词消息", userID)
+        log.Printf("🚫 已删除用户 %d(%s) 的敏感关键词消息", userID, userName)
         return
     }
 }
@@ -405,7 +432,7 @@ if update.Message != nil {
                 ChatID: chatID,
                 UserID: userID,
             })
-            log.Printf("🚫 已拒绝无用户名用户 user=%d", userID)
+            log.Printf("🚫 已拒绝无用户名用户 %d(%s)", userID, username)
             return
         }
 
@@ -414,7 +441,7 @@ if update.Message != nil {
             UserID: userID,
         })
         if err != nil || !ok {
-            log.Printf("批准用户失败 user=%d err=%v", userID, err)
+            log.Printf("批准用户%d(%s)失败%v", userID, username, err)
             return
         }
 
@@ -528,8 +555,6 @@ if update.Message != nil {
 }
 
 func main() {
-    initAC() // 初始化 Aho-Corasick
-
     ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
     defer cancel()
 
@@ -547,6 +572,7 @@ func main() {
         log.Fatalf("bot.New error: %v", err)
     }
 
+    initAC() // 初始化 Aho-Corasick
     log.Println("Bot 已启动")
     safeGo(func() { b.Start(ctx) })
 
